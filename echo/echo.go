@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -9,7 +10,6 @@ import (
 	"net"
 	"os"
 	"syscall"
-	"bytes"
 )
 
 var (
@@ -33,10 +33,10 @@ func init() {
 		os.Exit(0)
 	}
 	target = flag.Args()[0]
-	fmt.Println("target:",target)
-	fmt.Println("network: ",*network)
-	fmt.Println("local: ",*port)
-	fmt.Println("echo: ",*isEcho)
+	fmt.Println("target:", target)
+	fmt.Println("network: ", *network)
+	fmt.Println("local: ", *port)
+	fmt.Println("echo: ", *isEcho)
 }
 
 func main() {
@@ -46,25 +46,25 @@ func main() {
 	go input(ch)
 	laddr := &net.TCPAddr{Port: *port}
 	dialer := net.Dialer{
-		Control: CONTROL,
+		Control:   CONTROL,
 		LocalAddr: laddr,
 	}
-	tcpConn,err:=dialer.Dial("tcp",target)
-	if err==nil{
+	tcpConn, err := dialer.Dial("tcp", target)
+	if err == nil {
 		go recvTCP(tcpConn)
-	}else{
+	} else {
 		fmt.Println("tcp: no connection")
 		//os.Exit(0)
 	}
 	for text := range ch {
-		if (*network == "udp") {
+		if *network == "udp" {
 			callUDP(target, *port, text)
-		}else if (*network == "tcp") {
-			if _,err:=tcpConn.Write(text);err!=nil{
-				tcpConn,err:=dialer.Dial("tcp",target)
-				if err==nil{
+		} else if *network == "tcp" {
+			if _, err := tcpConn.Write(text); err != nil {
+				tcpConn, err := dialer.Dial("tcp", target)
+				if err == nil {
 					go recvTCP(tcpConn)
-				}else{
+				} else {
 					fmt.Println("tcp: no connection")
 					os.Exit(0)
 				}
@@ -77,30 +77,29 @@ func input(ch chan []byte) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		text := scanner.Bytes()
-		if bytes.HasPrefix(text,[]byte("/switch")){
-			dst:=bytes.SplitN(text,[]byte{0x20},2)[1]
+		if bytes.HasPrefix(text, []byte("/switch")) {
+			dst := bytes.SplitN(text, []byte{0x20}, 2)[1]
 			target = string(dst)
-			fmt.Printf("new target: %s\n",target)
+			fmt.Printf("new target: %s\n", target)
 			continue
-		}else if bytes.HasPrefix(text,[]byte("/net")){
-			nw:=bytes.SplitN(text,[]byte{0x20},2)[1]
+		} else if bytes.HasPrefix(text, []byte("/net")) {
+			nw := bytes.SplitN(text, []byte{0x20}, 2)[1]
 			*network = string(nw)
-			fmt.Printf("network: %s\n",*network)
+			fmt.Printf("network: %s\n", *network)
 			continue
 		}
 		ch <- text
 	}
 }
 
-
-func callUDP(target string,port int, msg []byte) {
+func callUDP(target string, port int, msg []byte) {
 	laddr := &net.UDPAddr{Port: port}
 	dialer := net.Dialer{
-		Control: CONTROL,
+		Control:   CONTROL,
 		LocalAddr: laddr,
 	}
-	conn,err:=dialer.Dial("udp",target)
-	if err!=nil{
+	conn, err := dialer.Dial("udp", target)
+	if err != nil {
 		fmt.Println(err)
 		return
 	}
@@ -109,7 +108,7 @@ func callUDP(target string,port int, msg []byte) {
 }
 
 func recvTCP(conn net.Conn) {
-	buf:=make([]byte,1024)
+	buf := make([]byte, 1024)
 	for {
 		raddr := conn.RemoteAddr().String()
 		n, err := conn.Read(buf)
@@ -117,13 +116,13 @@ func recvTCP(conn net.Conn) {
 			fmt.Println(err)
 			return
 		}
-		fmt.Printf("tcp: [%s]::\n",raddr)
+		fmt.Printf("tcp: [%s]::\n", raddr)
 		fmt.Printf("recv: %s", buf[:n])
-		if (*isEcho){
-			buff:=append(buf[:n],[]byte(" << " + raddr)...)
+		if *isEcho {
+			buff := append(buf[:n], []byte(" << "+raddr)...)
 			conn.Write(buff)
 			fmt.Printf(" >>\n")
-		}else{
+		} else {
 			fmt.Printf("\n")
 		}
 	}
@@ -136,10 +135,10 @@ func echoTCP(port int) {
 		Control: CONTROL,
 	}
 	/*
-	dialer := net.Dialer{
-		LocalAddr: tcpAddr,
-		Control:   CONTROL,
-	}
+		dialer := net.Dialer{
+			LocalAddr: tcpAddr,
+			Control:   CONTROL,
+		}
 	*/
 	ctx := context.Background()
 	lis, err := lisc.Listen(ctx, "tcp", addr)
@@ -176,13 +175,13 @@ func echoUDP(port int) {
 		if err != nil {
 			fmt.Println(err)
 		}
-		fmt.Printf("udp: [%s]::\n",raddr.String())
+		fmt.Printf("udp: [%s]::\n", raddr.String())
 		fmt.Printf("recv: %s", buf[:n])
-		if (!*isEcho) {
+		if !*isEcho {
 			fmt.Printf("\n")
 			continue
 		}
-		buff:=append(buf[:n],[]byte(" << " + raddr.String())...)	
+		buff := append(buf[:n], []byte(" << "+raddr.String())...)
 		conn.WriteToUDP(buff, raddr)
 		fmt.Printf(" >>\n")
 	}

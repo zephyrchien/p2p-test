@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"syscall"
+
 )
 
 const REGISTER_TCP = 0x01
@@ -15,42 +16,61 @@ const REGISTER_UDP = 0x02
 const STATUS_WAIT = 0x01
 const STATUS_OK = 0x02
 
+const CLIENT_FIRST = 0x01
+const CLIENT_SECOND = 0x02
+
+
 type peer struct {
 	lock    sync.Mutex
-	tcpPeer []string
-	udpPeer []string
+	tcpPeer []*net.TCPConn
+	udpPeer []*net.UDPAddr
 }
 
-func (p *peer) find(t byte) string {
+func (p *peer)findTCP() *net.TCPConn{
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	var addr string
-	if t == REGISTER_TCP && len(p.tcpPeer) == 1 {
-		addr = p.tcpPeer[0]
-	} else if t == REGISTER_UDP && len(p.udpPeer) == 1 {
-		addr = p.udpPeer[0]
+	if len(p.tcpPeer)==1 {
+		return p.tcpPeer[0]
 	}
-	return addr
+	return nil
 }
 
-func (p *peer) register(t byte, addr string) {
+func (p *peer) findUDP() *net.UDPAddr {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if t == REGISTER_TCP {
-		p.tcpPeer[0] = addr
-	} else if t == REGISTER_UDP {
-		p.udpPeer[0] = addr
+	if len(p.udpPeer) == 1 {
+		return p.udpPeer[0]
 	}
+	return nil
 }
 
-func (p *peer) unregister(t byte) {
+
+func (p *peer) registerTCP(conn *net.TCPConn) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if t == REGISTER_TCP {
-		p.tcpPeer = p.tcpPeer[:0]
-	} else if t == REGISTER_UDP {
-		p.udpPeer = p.udpPeer[:0]
-	}
+	p.tcpPeer= append(p.tcpPeer,conn)
+}
+
+func (p *peer)registerUDP(addr *net.UDPAddr){
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.udpPeer=append(p.udpPeer,addr)
+}
+
+func (p *peer) unregisterTCP() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	/*
+	for _,conn:=range p.tcpPeer{
+		conn.Close()
+	}*/
+	p.tcpPeer = p.tcpPeer[:0]
+}
+
+func (p *peer) unregisterUDP() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.udpPeer = p.udpPeer[:0]
 }
 
 var CONTROL = func(network, address string, c syscall.RawConn) error {
@@ -61,11 +81,11 @@ var CONTROL = func(network, address string, c syscall.RawConn) error {
 }
 
 var Peer = &peer{
-	tcpPeer: make([]string, 0, 4),
-	udpPeer: make([]string, 0, 4),
+	tcpPeer: make([]*net.TCPConn, 0,4),
+	udpPeer: make([]*net.UDPAddr, 0,4),
 }
 
-const addr = "0.0.0.0:8888"
+const addr = "0.0.0.0:8388"
 
 func main() {
 	go serveTCP(addr)
@@ -89,7 +109,11 @@ func serveTCP(addr string) {
 		if err != nil {
 			continue
 		}
-		go handleTCPConn(conn)
+		tcpConn,ok:=conn.(*net.TCPConn)
+		if !ok{
+			continue
+		}
+		go handleTCPConn(tcpConn)
 	}
 }
 
@@ -115,21 +139,21 @@ func serveUDP(addr string) {
 		}
 		fmt.Printf("udp: [%s] -> [%s]\n", raddr, uconn.LocalAddr().String())
 
-		if err != nil || n < 9 {
+		if err != nil || n < 3 {
 			fmt.Printf("error: udp: packet size = %d\n", n)
 			continue
 		}
 
 		t := buf[1]
-		if buf[0] != 0x00 || (t != REGISTER_TCP || t != REGISTER_UDP) {
+		if buf[0] != 0x00 || (t != REGISTER_TCP && t != REGISTER_UDP) {
 			fmt.Printf("error: udp: unknown cmd\n")
 			continue
 		}
-		go handleUDPConn(t, uconn, raddr)
+		go handleUDPConn(uconn, raddr)
 	}
 }
 
-func handleTCPConn(conn net.Conn) {
+func handleTCPConn(conn *net.TCPConn) {
 	/*
 		switch c:=conn.(type) {
 		case *net.TCPConn:
@@ -138,49 +162,68 @@ func handleTCPConn(conn net.Conn) {
 			fmt.Printf("udp: [%s] -> [%s]\n",c.RemoteAddr().String(),c.LocalAddr().String())
 		}
 	*/
-	defer conn.Close()
 	buf := make([]byte, 1024)
 	raddr := conn.RemoteAddr().String()
 	fmt.Printf("tcp: [%s] -> [%s]\n", raddr, conn.LocalAddr().String())
 
 	n, err := conn.Read(buf)
-	if err != nil || n < 9 {
+	if err != nil || n < 3 {
 		fmt.Printf("error: tcp: packet size = %d\n", n)
 		return
 	}
 
 	t := buf[1]
-	if buf[0] != 0x00 || (t != REGISTER_TCP || t != REGISTER_UDP) {
+	if buf[0] != 0x00 || (t != REGISTER_TCP && t != REGISTER_UDP) {
 		fmt.Printf("error: tcp: unknown cmd\n")
 		return
 	}
-	fmt.Printf("tcp: [%s]: %s\n", raddr, buf[2:n])
 
-	response := makeResponse(t, raddr)
-	fmt.Printf("tcp-response: [%s]: %d %s\n", raddr, response[1], response[2:])
-	conn.Write(response)
-}
-
-func handleUDPConn(t byte, conn *net.UDPConn, raddr *net.UDPAddr) {
-	response := makeResponse(t, raddr.String())
-	fmt.Printf("udp-response: [%s]: %d %s\n", raddr.String(), response[1], response[2:])
-	conn.WriteToUDP(response, raddr)
-}
-
-func makeResponse(t byte, addr string) []byte {
-	peerAddr := Peer.find(t)
-	var msg string
-	var stat byte
-	if peerAddr == "" {
-		Peer.register(t, addr)
-		stat = STATUS_WAIT
-		msg = "registered, wait for peer.."
+	peerConn := Peer.findTCP()
+	if peerConn == nil {
+		Peer.registerTCP(conn)
+		msg := "registered, wait for peer.."
+		response:=append([]byte{0x00,STATUS_WAIT},msg...)
+		conn.Write(response)
+		fmt.Printf("tcp-response: [%s]: %d %s\n", raddr, response[1], response[2:])
+	} else if peerConn.RemoteAddr().String() == raddr {
+		msg := "registered, wait for peer.."
+		response:=append([]byte{0x00,STATUS_WAIT},msg...)
+		conn.Write(response)
+		fmt.Printf("tcp-response: [%s]: %d %s\n", raddr, response[1], response[2:])
 	} else {
-		Peer.unregister(t)
-		stat = STATUS_OK
-		msg = peerAddr
+		Peer.unregisterTCP()
+		response:=append([]byte{0x00,STATUS_OK},peerConn.RemoteAddr().String()...)
+		conn.Write(response)
+		fmt.Printf("tcp-response: [%s]: %d %s\n", raddr, response[1], response[2:])
+
+		notice:=append([]byte{0x00,STATUS_OK},raddr...)
+		peerConn.Write(notice)
+		fmt.Printf("tcp-notice: [%s]: %d %s\n", peerConn.RemoteAddr().String(), notice[1], notice[2:])
 	}
-	response := []byte{0x00, stat}
-	response = append(response, []byte(msg)...)
-	return response
+}
+
+func handleUDPConn(conn *net.UDPConn, raddr *net.UDPAddr) {
+	peerAddr := Peer.findUDP()
+	addr:=raddr.String()
+	if peerAddr == nil {
+		Peer.registerUDP(raddr)
+		msg := "registered, wait for peer.."
+		response:=append([]byte{0x00,STATUS_WAIT,CLIENT_FIRST},msg...)
+		conn.WriteToUDP(response, raddr)
+		fmt.Printf("udp-response: [%s]: %d %s\n", addr, response[1], response[2:])
+	} else if peerAddr.String() == addr {
+		msg := "registered, wait for peer.."
+		response:=append([]byte{0x00,STATUS_WAIT,CLIENT_FIRST},msg...)
+		conn.WriteToUDP(response, raddr)
+		fmt.Printf("udp-response: [%s]: %d %s\n", addr, response[1], response[2:])
+	} else {
+		Peer.unregisterUDP()
+		response:=append([]byte{0x00,STATUS_OK,CLIENT_SECOND},peerAddr.String()...)
+		conn.WriteToUDP(response, raddr)
+		fmt.Printf("udp-response: [%s]: %d %s\n", addr, response[1], response[2:])
+
+		notice:=append([]byte{0x00,STATUS_OK,CLIENT_FIRST},addr...)
+		conn.WriteToUDP(notice,peerAddr)
+		fmt.Printf("udp-notice: [%s]: %d %s\n", peerAddr.String(), notice[1], notice[2:])
+	}
 }
