@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"net"
@@ -13,12 +14,13 @@ import (
 
 var (
 	KeepAliveCount int
-	ActiveClient bool
-	PunchFrom bool
-	PunchTo   bool 
-	Network   = flag.String("net", "udp", "")
-	LADDR     = flag.String("l", ":8388", "listen addr")
-	RADDR     = flag.String("s", "", "remote addr")
+	EchoOff        bool
+	ActiveClient   bool
+	PunchFrom      bool
+	PunchTo        bool
+	Network        = flag.String("net", "udp", "")
+	LADDR          = flag.String("l", ":8388", "listen addr")
+	RADDR          = flag.String("s", "", "remote addr")
 )
 
 // color
@@ -29,31 +31,30 @@ const (
 	Green   = "\033[1;32m%s\033[0m"
 	Yellow  = "\033[1;33m%s\033[0m"
 	Blue    = "\033[1;34m%s\033[0m"
-	Purple  = "\033[1;34m%s\033[0m"
 	Magenta = "\033[1;35m%s\033[0m"
 	Teal    = "\033[1;36m%s\033[0m"
 	White   = "\033[1;37m%s\033[0m"
 )
 
-func Color(color string)func(string){
-	return func(s string){
-		fmt.Printf(color,s)
+func Color(color string) func(string) {
+	return func(s string) {
+		fmt.Printf(color, s)
 	}
 }
 
 var (
-	Color_Black = Color(Black)
-	Color_Red = Color(Red)
-	Color_Green = Color(Green)
-	Color_Yellow = Color(Yellow)
-	Color_Blue = Color(Blue)
-	Color_Purple = Color(Purple)
+	Color_Black   = Color(Black)
+	Color_Red     = Color(Red)
+	Color_Green   = Color(Green)
+	Color_Yellow  = Color(Yellow)
+	Color_Blue    = Color(Blue)
 	Color_Magenta = Color(Magenta)
-	Color_Teal = Color(Teal)
-	Color_White = Color(White)
+	Color_Teal    = Color(Teal)
+	Color_White   = Color(White)
 )
 
 const BUFFERSIZE = 1024
+const KEEP_ALIVE_INTERVAL = 5
 
 const DISPATCHER = 0x00
 const PEER = 0x01
@@ -73,58 +74,131 @@ const PING = 0x01
 const BENCH = 0x02
 
 const PING_START = 0x00
-const PING_PAUSE = 0xff
-const PING_CONTINUE = 0x01
+const PING_DATA = 0x01
+const PING_PAUSE = 0x02
+const PING_SUMMARY = 0xff
 
-type pinger struct{
-	active bool
-	lock sync.Mutex
-	max int64
-	min int64
-	sum int64
+const BENCH_START = 0x00
+const BENCH_DATA = 0x01
+const BENCH_PAUSE = 0x02
+const BENCH_SUMMARY = 0xff
+
+type pinger struct {
+	active  bool
+	lock    sync.Mutex
+	max     int64
+	min     int64
+	sum     int64
 	latency []int64
 }
 
-func (p *pinger)analysis(data []byte){
-	switch mark:=data[0];mark{
-	case 0x00:
-		p.active = true
-		return
-	case 0xff:
-		if p.active{
-			avg:= int(p.sum)/len(p.latency)
-			Color_Blue(fmt.Sprintf("udp::peer::ping: %d/%d/%d\n",p.min,avg,p.max))
-			p.active = false
-		}
-	default:
-		p.lock.Lock()
-		defer p.lock.Unlock()
-		now:=time.Now()
-		last:=time.Time{}
-		if err:=last.UnmarshalBinary(data[1:]);err!=nil{
-			Color_Red(fmt.Sprintf("udp::self::ping: unserialize time failed, %s\n",err))
-			return
-		}
-		d:=now.Sub(last).Milliseconds()
-		Color_Blue(fmt.Sprintf("udp::peer::ping::latency: %dms\n",d))
-		p.latency = append(p.latency,d)
-		p.sum += d
-		if len(p.latency)==1{
-			p.min = d
-			p.max = d
-			return
-		}
-		if d < p.min{
-			p.min = d
-		}
-		if d > p.max {
-			p.max = d
-		}
-	}
-
+func (p *pinger) start() {
+	p.active = true
 }
 
-var Pinger = &pinger{latency: make([]int64,0,50)}
+func (p *pinger) pause() {
+	p.active = false
+}
+
+func (p *pinger) summary() string {
+	var result string
+	if p.active {
+		avg := int(p.sum) / len(p.latency)
+		result = fmt.Sprintf("min/avg/max = %d/%d/%dms", p.min, avg, p.max)
+		p.active = false
+	}
+	return result
+}
+
+func (p *pinger) collect(data []byte) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	now := time.Now()
+	last := time.Time{}
+	if err := last.UnmarshalBinary(data); err != nil {
+		Color_Red(fmt.Sprintf("udp::self::ping: unserialize time failed, %s\n", err))
+		return
+	}
+	d := now.Sub(last).Milliseconds()
+
+	Color_Blue(fmt.Sprintf("udp::peer::ping::latency: %dms\n", d))
+	p.latency = append(p.latency, d)
+	p.sum += d
+	if len(p.latency) == 1 {
+		p.min = d
+		p.max = d
+		return
+	}
+	if d < p.min {
+		p.min = d
+	}
+	if d > p.max {
+		p.max = d
+	}
+}
+
+type downloader struct {
+	active bool
+	lock   sync.Mutex
+	total  uint64
+}
+
+func (dl *downloader) start() {
+	dl.active = true
+}
+
+func (dl *downloader) pause() {
+	dl.active = false
+}
+
+func (dl *downloader) summary() uint64 {
+	if dl.active {
+		dl.active = false
+		return dl.total
+	}
+	return 0
+}
+
+func (dl *downloader) collect(n int) {
+	dl.lock.Lock()
+	defer dl.lock.Unlock()
+	dl.total += uint64(n)
+}
+
+type limiter struct {
+	lock sync.Mutex
+	bs   int
+	max  int
+	next time.Time
+}
+
+func (lmt *limiter) set(max int) {
+	lmt.bs = max
+	lmt.max = max
+	lmt.next = time.Now().Add(1 * time.Second)
+}
+
+func (lmt *limiter) reset() {
+	lmt.bs = lmt.max
+	lmt.next = time.Now().Add(1 * time.Second)
+}
+
+func (lmt *limiter) collect(n int) {
+	//lmt.lock.Lock()
+	//defer lmt.lock.Unlock()
+	if lmt.bs < 0 {
+		now := time.Now()
+		delta := lmt.next.Sub(now)
+		time.Sleep(delta)
+	} else {
+		lmt.bs -= n
+	}
+}
+
+var (
+	Pinger     = &pinger{latency: make([]int64, 0, 50)}
+	Downloader = &downloader{}
+)
 
 func init() {
 	flag.Parse()
@@ -160,7 +234,7 @@ func serveTCP() {
 	dialer := net.Dialer{
 		LocalAddr: tcpAddr,
 		Control:   CONTROL,
-		KeepAlive: 5*time.Second,
+		KeepAlive: 5 * time.Second,
 	}
 	conn, err := dialer.Dial("tcp", *RADDR)
 	if err != nil {
@@ -186,7 +260,7 @@ func serveTCP() {
 			return
 		}
 		if rbuf[1] == STATUS_WAIT {
-			Color_Purple(fmt.Sprintf("tcp::dispatcher: %s\n", rbuf[2:n]))
+			Color_Magenta(fmt.Sprintf("tcp::dispatcher: %s\n", rbuf[2:n]))
 			continue
 		} else if rbuf[1] == STATUS_OK {
 			peerAddr = string(rbuf[2:n])
@@ -196,13 +270,13 @@ func serveTCP() {
 			return
 		}
 	}
-	Color_Purple(fmt.Sprintf("tcp::dispatcher: peer found: [%s]\n", peerAddr))
+	Color_Magenta(fmt.Sprintf("tcp::dispatcher: peer found: [%s]\n", peerAddr))
 
 	// peer
 	var peerConn net.Conn
 	ctx1, cancelDial := context.WithCancel(context.Background())
 	ctx2, cancelListen := context.WithCancel(context.Background())
-	wg:=sync.WaitGroup{}
+	wg := sync.WaitGroup{}
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -248,25 +322,25 @@ func serveTCP() {
 		return
 	}
 	Color_Blue(fmt.Sprintf("tcp::peer: connected! direction: << >>\n"))
-	go func(){
-		for{
-			n,err:=conn.Read(rbuf)
-			if err!=nil{
-				Color_Red(fmt.Sprintf("tcp::connection::error: %s\n",err))
+	go func() {
+		for {
+			n, err := conn.Read(rbuf)
+			if err != nil {
+				Color_Red(fmt.Sprintf("tcp::connection::error: %s\n", err))
 				return
 			}
-			Color_Blue(fmt.Sprintf("tcp::peer: %s\n",rbuf[:n]))
+			Color_Blue(fmt.Sprintf("tcp::peer: %s\n", rbuf[:n]))
 		}
 	}()
 
 	for {
-		wbuf=[]byte("ciallo")
-		_,err=conn.Write(wbuf)
-		if err!=nil{
-			Color_Red(fmt.Sprintf("tcp::connection::error: %s\n",err))
+		wbuf = []byte("ciallo")
+		_, err = conn.Write(wbuf)
+		if err != nil {
+			Color_Red(fmt.Sprintf("tcp::connection::error: %s\n", err))
 			return
 		}
-		time.Sleep(2*time.Second)
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -295,14 +369,16 @@ func serveUDP() {
 		uconn.WriteToUDP(b, dispatcherAddr)
 	}
 	// recv from dispatcher or peer
-	
+
 	for {
 		buf := make([]byte, BUFFERSIZE)
 		n, raddr, err := uconn.ReadFromUDP(buf)
 		if err != nil {
 			continue
 		}
-		Color_Yellow(fmt.Sprintf("udp: [%s] -> [%s] ::\n", raddr, uconn.LocalAddr().String()))
+		if !EchoOff {
+			Color_Yellow(fmt.Sprintf("udp: [%s] -> [%s] ::\n", raddr, uconn.LocalAddr().String()))
+		}
 
 		if err != nil || n < 3 {
 			Color_Red(fmt.Sprintf("udp::error: packet size = %d\n", n))
@@ -322,17 +398,17 @@ func serveUDP() {
 func handleUDPConn(raddr *net.UDPAddr, conn *net.UDPConn, data []byte) {
 	id := data[0]
 	stat := data[1]
-	extra:=data[2]
+	extra := data[2]
 	if id == DISPATCHER && stat == STATUS_WAIT {
 		if extra == 0x02 {
 			ActiveClient = true
 		}
-		Color_Purple(fmt.Sprintf("udp::dispatcher: %s\n", data[3:]))
+		Color_Magenta(fmt.Sprintf("udp::dispatcher: %s\n", data[3:]))
 	} else if id == DISPATCHER && stat == STATUS_OK {
 		if extra == 0x02 {
 			ActiveClient = true
 		}
-		Color_Purple(fmt.Sprintf("udp::dispatcher: peer found [%s]\n", data[2:]))
+		Color_Magenta(fmt.Sprintf("udp::dispatcher: peer found [%s]\n", data[2:]))
 		peerHostPort := strings.SplitN(string(data[3:]), ":", 2)
 		ip := net.ParseIP(peerHostPort[0])
 		port, err := strconv.Atoi(peerHostPort[1])
@@ -371,14 +447,14 @@ func handleUDPConn(raddr *net.UDPAddr, conn *net.UDPConn, data []byte) {
 				go func() {
 					for {
 						if PunchTo {
-							msg:=fmt.Sprintf("keep-alive[%d]",KeepAliveCount)
-							d := append([]byte{PEER, STATUS_OK,NONE},[]byte(msg)...)
-							conn.WriteToUDP(d, raddr)
+							msg := fmt.Sprintf("keep-alive[%d]", KeepAliveCount)
+							b := append([]byte{PEER, STATUS_OK, NONE}, []byte(msg)...)
+							conn.WriteToUDP(b, raddr)
 						} else {
 							return
 						}
 						KeepAliveCount++
-						time.Sleep(4 * time.Second)
+						time.Sleep(KEEP_ALIVE_INTERVAL * time.Second)
 					}
 				}()
 			}
@@ -386,13 +462,45 @@ func handleUDPConn(raddr *net.UDPAddr, conn *net.UDPConn, data []byte) {
 			Color_Blue("udp::peer: connected, direction: << >>\n")
 		}
 	} else if id == PEER && stat == STATUS_OK {
-		if extra == NONE{
-			Color_Blue(fmt.Sprintf("udp::peer::data: %s\n", data[3:]))
-			triggeredUDP(raddr,conn)
-		}else if extra == PING{
-			Pinger.analysis(data[3:])
-		}else if extra == BENCH{
+		if extra == NONE {
+			if !EchoOff {
+				Color_Blue(fmt.Sprintf("udp::peer::data: %s\n", data[3:]))
+			}
+			triggeredUDP(raddr, conn)
+		} else if extra == PING {
+			switch cmd := data[3]; cmd {
+			case PING_START:
+				Pinger.start()
+			case PING_DATA:
+				Pinger.collect(data[4:])
+			case PING_PAUSE:
+				if result := Pinger.summary(); result != "" {
+					Color_Magenta(fmt.Sprintf("udp::peer::ping::summary: %s\n", result))
+					b := append([]byte{PEER, STATUS_OK, PING, PING_SUMMARY}, result...)
+					conn.WriteToUDP(b, raddr)
+				}
+			case PING_SUMMARY:
+				Color_Magenta(fmt.Sprintf("udp::peer::ping::summary %s\n", data[4:]))
+			}
 
+		} else if extra == BENCH {
+			switch cmd := data[3]; cmd {
+			case BENCH_START:
+				Downloader.start()
+			case BENCH_DATA:
+				Downloader.collect(len(data))
+			case BENCH_PAUSE:
+				if total := Downloader.summary(); total != 0 {
+					Color_Magenta(fmt.Sprintf("udp::self::download::summary: [%d kb] [%d kbs]\n", total, total/5120))
+					intb := make([]byte, 8)
+					binary.BigEndian.PutUint64(intb, total)
+					b := append([]byte{PEER, STATUS_OK, BENCH, BENCH_SUMMARY}, intb...)
+					conn.WriteToUDP(b, raddr)
+				}
+			case BENCH_SUMMARY:
+				total := binary.BigEndian.Uint64(data[4:])
+				Color_Magenta(fmt.Sprintf("udp::peer::download::summary: [%d kb] [%d kbs]\n", total, total/5120))
+			}
 		}
 	} else {
 		Color_Red("udp: unknown cmd\n")
@@ -403,26 +511,68 @@ func triggeredUDP(raddr *net.UDPAddr, conn *net.UDPConn) {
 	if KeepAliveCount < 5 {
 		return
 	}
-	if KeepAliveCount < 10 {
+	if KeepAliveCount < 24 {
+		EchoOff = true
+	} else {
+		EchoOff = false
+	}
+	if KeepAliveCount < 9 && ActiveClient ||
+		(KeepAliveCount >= 10 && KeepAliveCount < 13 && !ActiveClient) {
 		// ping
-		start:=[]byte{PEER,STATUS_OK,PING,PING_START}
-		conn.WriteToUDP(start,raddr)
-		conn.WriteToUDP(start,raddr)
+		start := []byte{PEER, STATUS_OK, PING, PING_START}
+		conn.WriteToUDP(start, raddr)
+		conn.WriteToUDP(start, raddr)
 		Color_Green("udp::self::ping: start\n")
-		for i:=0;i<10;i++{
-			now,err:=time.Now().MarshalBinary()
-			if err!=nil{
-				Color_Red(fmt.Sprintf("udp::self::ping::error: serialize time failed, %s\n",err))
+		for i := 0; i < 10; i++ {
+			now, err := time.Now().MarshalBinary()
+			if err != nil {
+				Color_Red(fmt.Sprintf("udp::self::ping::error: serialize time failed, %s\n", err))
 				return
 			}
-			buf:=append([]byte{PEER,STATUS_OK,PING,PING_CONTINUE},now...)
-			conn.WriteToUDP(buf,raddr)
-			time.Sleep(300*time.Millisecond)
-			Color_Green(fmt.Sprintf("udp::self::ping: send[%d]\n",i))
+			buf := append([]byte{PEER, STATUS_OK, PING, PING_DATA}, now...)
+			conn.WriteToUDP(buf, raddr)
+			time.Sleep(300 * time.Millisecond)
+			Color_Green(fmt.Sprintf("udp::self::ping: send[%d]\n", i))
 		}
-		stop:=[]byte{PEER,STATUS_OK,PING,PING_PAUSE}
-		conn.WriteToUDP(stop,raddr)
-		conn.WriteToUDP(stop,raddr)
+		stop := []byte{PEER, STATUS_OK, PING, PING_PAUSE}
+		conn.WriteToUDP(stop, raddr)
+		conn.WriteToUDP(stop, raddr)
 		Color_Green("udp::self::ping: pause\n")
+		return
+	}
+	if KeepAliveCount >= 15 && KeepAliveCount < 18 && ActiveClient ||
+		(KeepAliveCount >= 20 && KeepAliveCount < 23 && !ActiveClient) {
+		start := []byte{PEER, STATUS_OK, BENCH, BENCH_START}
+		conn.WriteToUDP(start, raddr)
+		conn.WriteToUDP(start, raddr)
+		Color_Green("udp::self::upload: start\n")
+
+		var sec, bsec int
+		var btotal uint64
+		b := make([]byte, BUFFERSIZE)
+		b[0], b[1], b[2], b[3] = PEER, STATUS_OK, BENCH, BENCH_DATA
+		ticker := time.NewTicker(1 * time.Second)
+		lmt := new(limiter)
+		lmt.set(10 << 20)
+		for sec = 0; sec < 5; {
+			select {
+			case <-ticker.C:
+				sec++
+				bs := bsec / 1024
+				btotal += uint64(bsec)
+				lmt.reset()
+				bsec = 0
+				Color_Green(fmt.Sprintf("udp::self::upload: [%d] [%d kbs]\n", sec, bs))
+			default:
+				n, _ := conn.WriteToUDP(b, raddr)
+				bsec += n
+				lmt.collect(n)
+			}
+		}
+		Color_Magenta(fmt.Sprintf("udp::self::upload: [sum] [%d kb] [%d kbs]\n", btotal/1024, btotal/5120))
+		stop := []byte{PEER, STATUS_OK, BENCH, BENCH_PAUSE}
+		conn.WriteToUDP(stop, raddr)
+		conn.WriteToUDP(stop, raddr)
+		Color_Green("udp::self::upload: pause\n")
 	}
 }
